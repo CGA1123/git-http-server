@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -201,6 +202,44 @@ func TestGitOperations(t *testing.T) {
 				t.Errorf("got content %q, want %q", content, tt.fileContent)
 			}
 		})
+	}
+}
+
+func TestAutoCreatedRepoDefaultBranch(t *testing.T) {
+	root := t.TempDir()
+	handler := setupTestHandlerWithRoot(t, root)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	// Create local repo with a commit
+	srcRepo := t.TempDir()
+	runGit(t, srcRepo, "init")
+	runGit(t, srcRepo, "config", "user.email", "test@test.com")
+	runGit(t, srcRepo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(srcRepo, "README"), []byte("test"), 0644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+	runGit(t, srcRepo, "add", ".")
+	runGit(t, srcRepo, "commit", "-m", "initial")
+
+	// Push to auto-create repo
+	remoteURL := server.URL + "/ns/repo.git"
+	cmd := exec.Command("git", "push", remoteURL, "HEAD:refs/heads/main")
+	cmd.Dir = srcRepo
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("push failed: %v\n%s", err, out)
+	}
+
+	// Check HEAD symref points to main
+	cmd = exec.Command("git", "ls-remote", "--symref", remoteURL, "HEAD")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("ls-remote failed: %v\n%s", err, out)
+	}
+
+	expected := "ref: refs/heads/main"
+	if !strings.Contains(string(out), expected) {
+		t.Errorf("expected HEAD symref to contain %q, got:\n%s", expected, out)
 	}
 }
 

@@ -183,6 +183,12 @@ func (h *gitHTTPHandler) initRepo(path string) error {
 		return fmt.Errorf("git config failed: %w: %s", err, out)
 	}
 
+	// Set default branch to main
+	cmd = exec.Command("git", "-C", path, "symbolic-ref", "HEAD", "refs/heads/main")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git symbolic-ref failed: %w: %s", err, out)
+	}
+
 	return nil
 }
 
