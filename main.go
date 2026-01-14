@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"net/http/cgi"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 )
 
 func main() {
@@ -37,11 +42,43 @@ func main() {
 		gitHTTPBackend: gitPath,
 	}
 
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok\n"))
+	})
+	mux.Handle("/", handler)
+
 	addr := fmt.Sprintf(":%d", *port)
+	server := &http.Server{
+		Addr:    addr,
+		Handler: loggingMiddleware(mux),
+	}
+
+	// Handle shutdown signals
+	done := make(chan struct{})
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+
+		log.Println("shutting down...")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("shutdown error: %v", err)
+		}
+		close(done)
+	}()
+
 	log.Printf("starting git-http-server on %s, serving %s", addr, absRoot)
-	if err := http.ListenAndServe(addr, handler); err != nil {
+	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("server failed: %v", err)
 	}
+
+	<-done
+	log.Println("server stopped")
 }
 
 type gitHTTPHandler struct {
@@ -51,7 +88,7 @@ type gitHTTPHandler struct {
 
 func (h *gitHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Extract repository path from URL
-	// URL format: /<repo>.git/info/refs or /<repo>.git/git-upload-pack etc.
+	// URL format: /<namespace>/<repo>.git/info/refs or /<namespace>/<repo>.git/git-upload-pack etc.
 	path := r.URL.Path
 
 	// Find the .git part of the path to determine repo boundaries
@@ -71,6 +108,15 @@ func (h *gitHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Clean and validate the repo path
 	repoPath = strings.TrimPrefix(repoPath, "/")
+
+	// Validate format: must be <namespace>/<repo>.git
+	repoName := strings.TrimSuffix(repoPath, ".git")
+	parts := strings.Split(repoName, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		http.Error(w, "invalid repository path: must be <namespace>/<repo>.git", http.StatusBadRequest)
+		return
+	}
+
 	fullRepoPath := filepath.Join(h.rootDir, repoPath)
 
 	// Security: ensure we don't escape the root directory
@@ -81,8 +127,18 @@ func (h *gitHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Check if repository exists
 	if _, err := os.Stat(fullRepoPath); os.IsNotExist(err) {
-		http.Error(w, "repository not found", http.StatusNotFound)
-		return
+		// Auto-create repository on push
+		if h.isPushRequest(r, pathInfo) {
+			if err := h.initRepo(fullRepoPath); err != nil {
+				log.Printf("failed to create repository %s: %v", fullRepoPath, err)
+				http.Error(w, "failed to create repository", http.StatusInternalServerError)
+				return
+			}
+			log.Printf("created repository: %s", fullRepoPath)
+		} else {
+			http.Error(w, "repository not found", http.StatusNotFound)
+			return
+		}
 	}
 
 	// Set up CGI handler for git-http-backend
@@ -99,21 +155,71 @@ func (h *gitHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cgiHandler.ServeHTTP(w, r)
 }
 
+func (h *gitHTTPHandler) isPushRequest(r *http.Request, pathInfo string) bool {
+	// Check if this is a git-receive-pack request (push)
+	if strings.Contains(pathInfo, "git-receive-pack") {
+		return true
+	}
+	// Check query parameter for service=git-receive-pack (info/refs?service=git-receive-pack)
+	if r.URL.Query().Get("service") == "git-receive-pack" {
+		return true
+	}
+	return false
+}
+
+func (h *gitHTTPHandler) initRepo(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("failed to create parent directory: %w", err)
+	}
+
+	cmd := exec.Command("git", "init", "--bare", path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git init failed: %w: %s", err, out)
+	}
+
+	// Enable push support
+	cmd = exec.Command("git", "-C", path, "config", "http.receivepack", "true")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git config failed: %w: %s", err, out)
+	}
+
+	return nil
+}
+
 func findGitHTTPBackend() (string, error) {
-	// Common locations for git-http-backend
-	paths := []string{
-		"/usr/lib/git-core/git-http-backend",
-		"/usr/libexec/git-core/git-http-backend",
-		"/usr/local/libexec/git-core/git-http-backend",
-		"/opt/homebrew/libexec/git-core/git-http-backend",
-		"/usr/local/lib/git-core/git-http-backend",
+	cmd := exec.Command("git", "--exec-path")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to run 'git --exec-path': %w", err)
 	}
 
-	for _, p := range paths {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
+	execPath := strings.TrimSpace(string(out))
+	backendPath := filepath.Join(execPath, "git-http-backend")
+
+	if _, err := os.Stat(backendPath); err != nil {
+		return "", fmt.Errorf("git-http-backend not found at %s: %w", backendPath, err)
 	}
 
-	return "", fmt.Errorf("git-http-backend not found in common locations")
+	return backendPath, nil
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rw := &responseWriter{ResponseWriter: w, status: http.StatusOK}
+
+		next.ServeHTTP(rw, r)
+
+		log.Printf("%s %s %d %s", r.Method, r.URL.Path, rw.status, time.Since(start))
+	})
 }
