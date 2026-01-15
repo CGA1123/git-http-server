@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"html/template"
 	"log"
 	"net/http"
 	"net/http/cgi"
@@ -19,7 +20,7 @@ import (
 func main() {
 	var (
 		port    = flag.Int("port", 9418, "port to listen on")
-		rootDir = flag.String("root", ".", "root directory containing git repositories")
+		rootDir = flag.String("root", "./repositories", "root directory containing git repositories")
 	)
 	flag.Parse()
 
@@ -87,9 +88,27 @@ type gitHTTPHandler struct {
 }
 
 func (h *gitHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+
+	// Handle root path - list all repositories
+	if path == "/" {
+		h.serveRepoList(w, r)
+		return
+	}
+
+	// Check if this is a repository info page (/<namespace>/<repo> without .git)
+	if !strings.Contains(path, ".git") {
+		parts := strings.Split(strings.Trim(path, "/"), "/")
+		if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+			h.serveRepoInfo(w, r, parts[0], parts[1])
+			return
+		}
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
 	// Extract repository path from URL
 	// URL format: /<namespace>/<repo>.git/info/refs or /<namespace>/<repo>.git/git-upload-pack etc.
-	path := r.URL.Path
 
 	// Find the .git part of the path to determine repo boundaries
 	var repoPath string
@@ -190,6 +209,237 @@ func (h *gitHTTPHandler) initRepo(path string) error {
 	}
 
 	return nil
+}
+
+type commitInfo struct {
+	Hash      string
+	Message   string
+	Timestamp string
+}
+
+type repoInfo struct {
+	Namespace    string
+	Name         string
+	FullPath     string
+	LatestCommit string
+	CloneURL     string
+	Commits      []commitInfo
+}
+
+func (h *gitHTTPHandler) listRepositories() ([]repoInfo, error) {
+	var repos []repoInfo
+
+	entries, err := os.ReadDir(h.rootDir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, nsEntry := range entries {
+		if !nsEntry.IsDir() {
+			continue
+		}
+		nsPath := filepath.Join(h.rootDir, nsEntry.Name())
+		repoEntries, err := os.ReadDir(nsPath)
+		if err != nil {
+			continue
+		}
+		for _, repoEntry := range repoEntries {
+			if !repoEntry.IsDir() || !strings.HasSuffix(repoEntry.Name(), ".git") {
+				continue
+			}
+			repoName := strings.TrimSuffix(repoEntry.Name(), ".git")
+			repos = append(repos, repoInfo{
+				Namespace: nsEntry.Name(),
+				Name:      repoName,
+				FullPath:  nsEntry.Name() + "/" + repoName,
+			})
+		}
+	}
+
+	return repos, nil
+}
+
+func (h *gitHTTPHandler) getRepoInfo(namespace, name, host string) (*repoInfo, error) {
+	repoPath := filepath.Join(h.rootDir, namespace, name+".git")
+
+	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
+		return nil, err
+	}
+
+	info := &repoInfo{
+		Namespace: namespace,
+		Name:      name,
+		FullPath:  namespace + "/" + name,
+	}
+
+	// Get clone URL
+	scheme := "http"
+	if host != "" {
+		info.CloneURL = fmt.Sprintf("%s://%s/%s/%s.git", scheme, host, namespace, name)
+	}
+
+	// Get latest commit
+	cmd := exec.Command("git", "-C", repoPath, "log", "-1", "--format=%H %s", "--all")
+	if out, err := cmd.Output(); err == nil {
+		info.LatestCommit = strings.TrimSpace(string(out))
+	} else {
+		info.LatestCommit = "(no commits yet)"
+	}
+
+	// Get 10 latest commits on default branch
+	cmd = exec.Command("git", "-C", repoPath, "log", "-10", "--format=%H|%s|%cI", "HEAD")
+	if out, err := cmd.Output(); err == nil {
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		for _, line := range lines {
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, "|", 3)
+			if len(parts) == 3 {
+				info.Commits = append(info.Commits, commitInfo{
+					Hash:      parts[0][:7],
+					Message:   parts[1],
+					Timestamp: parts[2],
+				})
+			}
+		}
+	}
+
+	return info, nil
+}
+
+type repoListData struct {
+	Repos   []repoInfo
+	BaseURL string
+}
+
+var repoListTemplate = template.Must(template.New("list").Parse(`<!DOCTYPE html>
+<html>
+<head>
+    <title>Git Repositories</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 800px; margin: 50px auto; padding: 0 20px; }
+        h1 { border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        h2 { margin-top: 30px; font-size: 1.1em; color: #333; }
+        ul { list-style: none; padding: 0; }
+        li { padding: 10px 0; border-bottom: 1px solid #f0f0f0; }
+        a { color: #0366d6; text-decoration: none; font-weight: 500; }
+        a:hover { text-decoration: underline; }
+        .empty { color: #666; font-style: italic; }
+        .instructions { background: #f6f8fa; padding: 15px; border-radius: 6px; margin: 20px 0; }
+        .instructions h3 { margin-top: 0; font-size: 1em; color: #333; }
+        .instructions pre { background: #1f2328; color: #e6edf3; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.9em; }
+        .instructions code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace; }
+        .instructions p { margin: 10px 0; color: #555; font-size: 0.95em; }
+    </style>
+</head>
+<body>
+    <h1>Repositories</h1>
+    {{if .Repos}}
+    <ul>
+        {{range .Repos}}
+        <li><a href="/{{.FullPath}}">{{.FullPath}}</a></li>
+        {{end}}
+    </ul>
+    {{else}}
+    <p class="empty">No repositories found.</p>
+    {{end}}
+
+    <h2>Getting Started</h2>
+    <div class="instructions">
+        <h3>Push an existing repository</h3>
+        <p>Add this server as a remote and push:</p>
+        <pre><code>git remote add origin {{.BaseURL}}/&lt;namespace&gt;/&lt;repo&gt;.git
+git push -u origin main</code></pre>
+    </div>
+    <div class="instructions">
+        <h3>Create a new repository</h3>
+        <p>Initialize a new Git repository and push to create it on this server:</p>
+        <pre><code>mkdir my-project && cd my-project
+git init
+git add .
+git commit -m "Initial commit"
+git remote add origin {{.BaseURL}}/&lt;namespace&gt;/&lt;repo&gt;.git
+git push -u origin main</code></pre>
+    </div>
+</body>
+</html>
+`))
+
+var repoInfoTemplate = template.Must(template.New("info").Parse(`<!DOCTYPE html>
+<html>
+<head>
+    <title>{{.FullPath}}</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 800px; margin: 50px auto; padding: 0 20px; }
+        h1 { border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        h2 { margin-top: 30px; font-size: 1.2em; color: #333; }
+        .section { margin: 20px 0; }
+        .label { font-weight: 600; color: #333; }
+        .value { font-family: monospace; background: #f6f8fa; padding: 8px 12px; border-radius: 4px; display: block; margin-top: 5px; word-break: break-all; }
+        a { color: #0366d6; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .commits { list-style: none; padding: 0; }
+        .commits li { padding: 10px 0; border-bottom: 1px solid #f0f0f0; display: flex; align-items: center; }
+        .commit-hash { font-family: monospace; background: #f6f8fa; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; flex-shrink: 0; }
+        .commit-message { margin-left: 10px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .commit-time { color: #666; font-size: 0.85em; margin-left: 10px; flex-shrink: 0; text-align: right; }
+    </style>
+</head>
+<body>
+    <p><a href="/">&larr; Back to repositories</a></p>
+    <h1>{{.FullPath}}</h1>
+    <div class="section">
+        <span class="label">Clone URL:</span>
+        <code class="value">git clone {{.CloneURL}}</code>
+    </div>
+    <h2>Recent Commits</h2>
+    {{if .Commits}}
+    <ul class="commits">
+        {{range .Commits}}
+        <li>
+            <span class="commit-hash">{{.Hash}}</span>
+            <span class="commit-message" title="{{.Message}}">{{.Message}}</span>
+            <span class="commit-time">{{.Timestamp}}</span>
+        </li>
+        {{end}}
+    </ul>
+    {{else}}
+    <p style="color: #666; font-style: italic;">No commits yet.</p>
+    {{end}}
+</body>
+</html>
+`))
+
+func (h *gitHTTPHandler) serveRepoList(w http.ResponseWriter, r *http.Request) {
+	repos, err := h.listRepositories()
+	if err != nil {
+		http.Error(w, "failed to list repositories", http.StatusInternalServerError)
+		return
+	}
+
+	data := repoListData{
+		Repos:   repos,
+		BaseURL: "http://" + r.Host,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := repoListTemplate.Execute(w, data); err != nil {
+		log.Printf("template error: %v", err)
+	}
+}
+
+func (h *gitHTTPHandler) serveRepoInfo(w http.ResponseWriter, r *http.Request, namespace, name string) {
+	info, err := h.getRepoInfo(namespace, name, r.Host)
+	if err != nil {
+		http.Error(w, "repository not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := repoInfoTemplate.Execute(w, info); err != nil {
+		log.Printf("template error: %v", err)
+	}
 }
 
 func findGitHTTPBackend() (string, error) {

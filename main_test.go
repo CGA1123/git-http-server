@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -277,5 +278,119 @@ func runGit(t *testing.T, dir string, args ...string) {
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, out)
+	}
+}
+
+func TestRepoListPage(t *testing.T) {
+	root := t.TempDir()
+
+	// Create some repos
+	for _, repo := range []string{"org1/repo1.git", "org1/repo2.git", "org2/project.git"} {
+		repoPath := filepath.Join(root, repo)
+		if err := os.MkdirAll(repoPath, 0755); err != nil {
+			t.Fatalf("failed to create repo dir: %v", err)
+		}
+		runGit(t, repoPath, "init", "--bare")
+	}
+
+	handler := setupTestHandlerWithRoot(t, root)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/")
+	if err != nil {
+		t.Fatalf("failed to get /: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	// Check content type
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Errorf("expected Content-Type text/html, got %s", ct)
+	}
+
+	// Check all repos are listed
+	for _, expected := range []string{"org1/repo1", "org1/repo2", "org2/project"} {
+		if !strings.Contains(bodyStr, expected) {
+			t.Errorf("expected body to contain %q", expected)
+		}
+	}
+}
+
+func TestRepoInfoPage(t *testing.T) {
+	root := t.TempDir()
+
+	// Create repo with a commit
+	repoPath := filepath.Join(root, "myorg/myrepo.git")
+	if err := os.MkdirAll(repoPath, 0755); err != nil {
+		t.Fatalf("failed to create repo dir: %v", err)
+	}
+	runGit(t, repoPath, "init", "--bare")
+
+	// Create a commit via a temp clone
+	srcRepo := t.TempDir()
+	runGit(t, srcRepo, "init")
+	runGit(t, srcRepo, "config", "user.email", "test@test.com")
+	runGit(t, srcRepo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(srcRepo, "README"), []byte("hello"), 0644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+	runGit(t, srcRepo, "add", ".")
+	runGit(t, srcRepo, "commit", "-m", "test commit message")
+	runGit(t, srcRepo, "push", repoPath, "HEAD:refs/heads/main")
+
+	handler := setupTestHandlerWithRoot(t, root)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/myorg/myrepo")
+	if err != nil {
+		t.Fatalf("failed to get /myorg/myrepo: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	bodyStr := string(body)
+
+	// Check content type
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Errorf("expected Content-Type text/html, got %s", ct)
+	}
+
+	// Check repo info
+	if !strings.Contains(bodyStr, "myorg/myrepo") {
+		t.Errorf("expected body to contain repo path")
+	}
+	if !strings.Contains(bodyStr, "test commit message") {
+		t.Errorf("expected body to contain commit message")
+	}
+	if !strings.Contains(bodyStr, ".git") {
+		t.Errorf("expected body to contain clone URL with .git")
+	}
+}
+
+func TestRepoInfoPage404(t *testing.T) {
+	handler := setupTestHandler(t)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/nonexistent/repo")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected status 404, got %d", resp.StatusCode)
 	}
 }
