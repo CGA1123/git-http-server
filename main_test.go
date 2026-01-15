@@ -263,11 +263,10 @@ func setupTestHandlerWithRoot(t *testing.T, root string) http.Handler {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok\n"))
-	})
-	mux.Handle("/", handler)
+	mux.HandleFunc("GET /healthz", handleHealthz)
+	mux.HandleFunc("GET /{$}", handler.handleRepoList)
+	mux.HandleFunc("GET /{namespace}/{repo}", handler.handleRepoInfo)
+	mux.HandleFunc("/", handler.handleGitBackend)
 
 	return loggingMiddleware(mux)
 }
@@ -392,5 +391,92 @@ func TestRepoInfoPage404(t *testing.T) {
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("expected status 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestRepoInfoPageRedirectsGitSuffix(t *testing.T) {
+	root := t.TempDir()
+
+	// Create repo
+	repoPath := filepath.Join(root, "myorg/myrepo.git")
+	if err := os.MkdirAll(repoPath, 0755); err != nil {
+		t.Fatalf("failed to create repo dir: %v", err)
+	}
+	runGit(t, repoPath, "init", "--bare")
+
+	handler := setupTestHandlerWithRoot(t, root)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	// Don't follow redirects
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	resp, err := client.Get(server.URL + "/myorg/myrepo.git")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMovedPermanently {
+		t.Errorf("expected status 301, got %d", resp.StatusCode)
+	}
+
+	location := resp.Header.Get("Location")
+	if location != "/myorg/myrepo" {
+		t.Errorf("expected redirect to /myorg/myrepo, got %s", location)
+	}
+}
+
+func TestGitOperationsWithoutGitSuffix(t *testing.T) {
+	root := t.TempDir()
+
+	// Create repo with .git suffix on disk
+	repoPath := filepath.Join(root, "org/repo.git")
+	if err := os.MkdirAll(repoPath, 0755); err != nil {
+		t.Fatalf("failed to create repo dir: %v", err)
+	}
+	runGit(t, repoPath, "init", "--bare")
+	runGit(t, repoPath, "config", "http.receivepack", "true")
+
+	handler := setupTestHandlerWithRoot(t, root)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	// Create local repo with a commit
+	srcRepo := t.TempDir()
+	runGit(t, srcRepo, "init")
+	runGit(t, srcRepo, "config", "user.email", "test@test.com")
+	runGit(t, srcRepo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(srcRepo, "README"), []byte("hello"), 0644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+	runGit(t, srcRepo, "add", ".")
+	runGit(t, srcRepo, "commit", "-m", "test")
+
+	// Push using URL WITHOUT .git suffix
+	remoteURL := server.URL + "/org/repo"
+	cmd := exec.Command("git", "push", remoteURL, "HEAD:refs/heads/main")
+	cmd.Dir = srcRepo
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("push failed: %v\n%s", err, out)
+	}
+
+	// Clone using URL WITHOUT .git suffix
+	cloneDir := t.TempDir()
+	cmd = exec.Command("git", "clone", remoteURL, cloneDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("clone failed: %v\n%s", err, out)
+	}
+
+	content, err := os.ReadFile(filepath.Join(cloneDir, "README"))
+	if err != nil {
+		t.Fatalf("failed to read cloned file: %v", err)
+	}
+	if string(content) != "hello" {
+		t.Errorf("got content %q, want %q", content, "hello")
 	}
 }

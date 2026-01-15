@@ -44,11 +44,10 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok\n"))
-	})
-	mux.Handle("/", handler)
+	mux.HandleFunc("GET /healthz", handleHealthz)
+	mux.HandleFunc("GET /{$}", handler.handleRepoList)
+	mux.HandleFunc("GET /{namespace}/{repo}", handler.handleRepoInfo)
+	mux.HandleFunc("/", handler.handleGitBackend)
 
 	addr := fmt.Sprintf(":%d", *port)
 	server := &http.Server{
@@ -87,54 +86,86 @@ type gitHTTPHandler struct {
 	gitHTTPBackend string
 }
 
-func (h *gitHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok\n"))
+}
+
+func (h *gitHTTPHandler) handleRepoList(w http.ResponseWriter, r *http.Request) {
+	repos, err := h.listRepositories()
+	if err != nil {
+		http.Error(w, "failed to list repositories", http.StatusInternalServerError)
+		return
+	}
+
+	data := repoListData{
+		Repos:   repos,
+		BaseURL: "http://" + r.Host,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := repoListTemplate.Execute(w, data); err != nil {
+		log.Printf("template error: %v", err)
+	}
+}
+
+func (h *gitHTTPHandler) handleRepoInfo(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+	name := r.PathValue("repo")
+
+	// Redirect .git URLs to clean URLs
+	if strings.HasSuffix(name, ".git") {
+		cleanURL := "/" + namespace + "/" + strings.TrimSuffix(name, ".git")
+		http.Redirect(w, r, cleanURL, http.StatusMovedPermanently)
+		return
+	}
+
+	info, err := h.getRepoInfo(namespace, name, r.Host)
+	if err != nil {
+		http.Error(w, "repository not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := repoInfoTemplate.Execute(w, info); err != nil {
+		log.Printf("template error: %v", err)
+	}
+}
+
+func (h *gitHTTPHandler) handleGitBackend(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
-	// Handle root path - list all repositories
-	if path == "/" {
-		h.serveRepoList(w, r)
-		return
-	}
-
-	// Check if this is a repository info page (/<namespace>/<repo> without .git)
-	if !strings.Contains(path, ".git") {
-		parts := strings.Split(strings.Trim(path, "/"), "/")
-		if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
-			h.serveRepoInfo(w, r, parts[0], parts[1])
-			return
-		}
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-
-	// Extract repository path from URL
-	// URL format: /<namespace>/<repo>.git/info/refs or /<namespace>/<repo>.git/git-upload-pack etc.
-
-	// Find the .git part of the path to determine repo boundaries
-	var repoPath string
+	// Parse /<namespace>/<repo>[.git]/<path> format
+	// Supports both with and without .git suffix
+	var repoName string
 	var pathInfo string
 
 	if idx := strings.Index(path, ".git/"); idx != -1 {
-		repoPath = path[:idx+4] // include .git
+		repoName = path[1:idx] // strip leading /, exclude .git
 		pathInfo = path[idx+4:]
 	} else if strings.HasSuffix(path, ".git") {
-		repoPath = path
+		repoName = strings.TrimSuffix(strings.TrimPrefix(path, "/"), ".git")
 		pathInfo = ""
 	} else {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
+		// Handle URLs without .git: /<namespace>/<repo>/<git-path>
+		parts := strings.SplitN(strings.TrimPrefix(path, "/"), "/", 3)
+		if len(parts) < 3 {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		repoName = parts[0] + "/" + parts[1]
+		pathInfo = "/" + parts[2]
 	}
 
-	// Clean and validate the repo path
-	repoPath = strings.TrimPrefix(repoPath, "/")
-
-	// Validate format: must be <namespace>/<repo>.git
-	repoName := strings.TrimSuffix(repoPath, ".git")
+	// Validate format: must be <namespace>/<repo>
 	parts := strings.Split(repoName, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		http.Error(w, "invalid repository path: must be <namespace>/<repo>.git", http.StatusBadRequest)
+		http.Error(w, "invalid repository path: must be <namespace>/<repo>", http.StatusBadRequest)
 		return
 	}
+
+	// Normalize to .git path for filesystem and git-http-backend
+	repoPath := repoName + ".git"
 
 	fullRepoPath := filepath.Join(h.rootDir, repoPath)
 
@@ -167,7 +198,7 @@ func (h *gitHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Env: []string{
 			"GIT_PROJECT_ROOT=" + h.rootDir,
 			"GIT_HTTP_EXPORT_ALL=1",
-			"PATH_INFO=" + "/" + repoPath + pathInfo,
+			"PATH_INFO=/" + repoPath + pathInfo,
 		},
 	}
 
@@ -410,37 +441,6 @@ var repoInfoTemplate = template.Must(template.New("info").Parse(`<!DOCTYPE html>
 </body>
 </html>
 `))
-
-func (h *gitHTTPHandler) serveRepoList(w http.ResponseWriter, r *http.Request) {
-	repos, err := h.listRepositories()
-	if err != nil {
-		http.Error(w, "failed to list repositories", http.StatusInternalServerError)
-		return
-	}
-
-	data := repoListData{
-		Repos:   repos,
-		BaseURL: "http://" + r.Host,
-	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := repoListTemplate.Execute(w, data); err != nil {
-		log.Printf("template error: %v", err)
-	}
-}
-
-func (h *gitHTTPHandler) serveRepoInfo(w http.ResponseWriter, r *http.Request, namespace, name string) {
-	info, err := h.getRepoInfo(namespace, name, r.Host)
-	if err != nil {
-		http.Error(w, "repository not found", http.StatusNotFound)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := repoInfoTemplate.Execute(w, info); err != nil {
-		log.Printf("template error: %v", err)
-	}
-}
 
 func findGitHTTPBackend() (string, error) {
 	cmd := exec.Command("git", "--exec-path")
