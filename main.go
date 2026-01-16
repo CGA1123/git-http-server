@@ -46,6 +46,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("GET /{$}", handler.handleRepoList)
+	mux.HandleFunc("GET /{namespace}/{repo}/commit/{sha}", handler.handleCommitInfo)
 	mux.HandleFunc("GET /{namespace}/{repo}", handler.handleRepoInfo)
 	mux.HandleFunc("/", handler.handleGitBackend)
 
@@ -130,6 +131,73 @@ func (h *gitHTTPHandler) handleRepoInfo(w http.ResponseWriter, r *http.Request) 
 	if err := repoInfoTemplate.Execute(w, info); err != nil {
 		log.Printf("template error: %v", err)
 	}
+}
+
+func (h *gitHTTPHandler) handleCommitInfo(w http.ResponseWriter, r *http.Request) {
+	namespace := r.PathValue("namespace")
+	name := r.PathValue("repo")
+	sha := r.PathValue("sha")
+
+	// Redirect .git URLs to clean URLs
+	if strings.HasSuffix(name, ".git") {
+		cleanURL := "/" + namespace + "/" + strings.TrimSuffix(name, ".git") + "/commit/" + sha
+		http.Redirect(w, r, cleanURL, http.StatusMovedPermanently)
+		return
+	}
+
+	repoPath := filepath.Join(h.rootDir, namespace, name+".git")
+	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
+		http.Error(w, "repository not found", http.StatusNotFound)
+		return
+	}
+
+	info, err := h.getCommitInfo(repoPath, namespace, name, sha)
+	if err != nil {
+		http.Error(w, "commit not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := commitDetailTemplate.Execute(w, info); err != nil {
+		log.Printf("template error: %v", err)
+	}
+}
+
+func (h *gitHTTPHandler) getCommitInfo(repoPath, namespace, name, sha string) (*commitDetailInfo, error) {
+	// Get commit metadata using null byte separator (can't appear in commit messages)
+	cmd := exec.Command("git", "-C", repoPath, "show", "-s", "--format=%H%x00%h%x00%an%x00%ae%x00%cI%x00%s%x00%b", sha)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	parts := strings.SplitN(strings.TrimSpace(string(out)), "\x00", 7)
+	if len(parts) < 6 {
+		return nil, fmt.Errorf("invalid commit format")
+	}
+
+	info := &commitDetailInfo{
+		Namespace: namespace,
+		RepoName:  name,
+		FullPath:  namespace + "/" + name,
+		Hash:      parts[0],
+		ShortHash: parts[1],
+		Author:    parts[2],
+		Email:     parts[3],
+		Date:      parts[4],
+		Subject:   parts[5],
+	}
+	if len(parts) >= 7 {
+		info.Body = strings.TrimSpace(parts[6])
+	}
+
+	// Get diff
+	cmd = exec.Command("git", "-C", repoPath, "show", "--format=", "--stat", "--patch", sha)
+	if diffOut, err := cmd.Output(); err == nil {
+		info.Diff = string(diffOut)
+	}
+
+	return info, nil
 }
 
 func (h *gitHTTPHandler) handleGitBackend(w http.ResponseWriter, r *http.Request) {
@@ -244,8 +312,23 @@ func (h *gitHTTPHandler) initRepo(path string) error {
 
 type commitInfo struct {
 	Hash      string
+	FullHash  string
 	Message   string
 	Timestamp string
+}
+
+type commitDetailInfo struct {
+	Namespace string
+	RepoName  string
+	FullPath  string
+	Hash      string
+	ShortHash string
+	Author    string
+	Email     string
+	Date      string
+	Subject   string
+	Body      string
+	Diff      string
 }
 
 type repoInfo struct {
@@ -318,17 +401,18 @@ func (h *gitHTTPHandler) getRepoInfo(namespace, name, host string) (*repoInfo, e
 	}
 
 	// Get 10 latest commits on default branch
-	cmd = exec.Command("git", "-C", repoPath, "log", "-10", "--format=%H|%s|%cI", "HEAD")
+	cmd = exec.Command("git", "-C", repoPath, "log", "-10", "--format=%H%x00%s%x00%cI", "HEAD")
 	if out, err := cmd.Output(); err == nil {
 		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 		for _, line := range lines {
 			if line == "" {
 				continue
 			}
-			parts := strings.SplitN(line, "|", 3)
+			parts := strings.SplitN(line, "\x00", 3)
 			if len(parts) == 3 {
 				info.Commits = append(info.Commits, commitInfo{
 					Hash:      parts[0][:7],
+					FullHash:  parts[0],
 					Message:   parts[1],
 					Timestamp: parts[2],
 				})
@@ -429,7 +513,7 @@ var repoInfoTemplate = template.Must(template.New("info").Parse(`<!DOCTYPE html>
     <ul class="commits">
         {{range .Commits}}
         <li>
-            <span class="commit-hash">{{.Hash}}</span>
+            <a href="/{{$.FullPath}}/commit/{{.FullHash}}" class="commit-hash">{{.Hash}}</a>
             <span class="commit-message" title="{{.Message}}">{{.Message}}</span>
             <span class="commit-time">{{.Timestamp}}</span>
         </li>
@@ -438,6 +522,42 @@ var repoInfoTemplate = template.Must(template.New("info").Parse(`<!DOCTYPE html>
     {{else}}
     <p style="color: #666; font-style: italic;">No commits yet.</p>
     {{end}}
+</body>
+</html>
+`))
+
+var commitDetailTemplate = template.Must(template.New("commit").Parse(`<!DOCTYPE html>
+<html>
+<head>
+    <title>{{.ShortHash}} - {{.FullPath}}</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 1000px; margin: 50px auto; padding: 0 20px; }
+        h1 { border-bottom: 1px solid #eee; padding-bottom: 10px; font-size: 1.5em; }
+        .breadcrumb { margin-bottom: 20px; }
+        .breadcrumb a { color: #0366d6; text-decoration: none; }
+        .breadcrumb a:hover { text-decoration: underline; }
+        .meta { background: #f6f8fa; padding: 15px; border-radius: 6px; margin-bottom: 20px; }
+        .meta-row { margin: 8px 0; }
+        .meta-label { font-weight: 600; color: #555; display: inline-block; width: 80px; }
+        .hash { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace; background: #e8e8e8; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+        .subject { font-size: 1.2em; font-weight: 600; margin: 15px 0; }
+        .body { white-space: pre-wrap; background: #f6f8fa; padding: 15px; border-radius: 6px; margin: 15px 0; font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace; font-size: 0.9em; }
+        .diff { background: #1f2328; color: #e6edf3; padding: 15px; border-radius: 6px; overflow-x: auto; font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace; font-size: 0.85em; white-space: pre; }
+        h2 { margin-top: 30px; font-size: 1.2em; color: #333; }
+    </style>
+</head>
+<body>
+    <p class="breadcrumb"><a href="/">&larr; Repositories</a> / <a href="/{{.FullPath}}">{{.FullPath}}</a></p>
+    <h1>Commit {{.ShortHash}}</h1>
+    <div class="meta">
+        <div class="meta-row"><span class="meta-label">Commit:</span> <span class="hash">{{.Hash}}</span></div>
+        <div class="meta-row"><span class="meta-label">Author:</span> {{.Author}} &lt;{{.Email}}&gt;</div>
+        <div class="meta-row"><span class="meta-label">Date:</span> {{.Date}}</div>
+    </div>
+    <div class="subject">{{.Subject}}</div>
+    {{if .Body}}<div class="body">{{.Body}}</div>{{end}}
+    <h2>Changes</h2>
+    <pre class="diff">{{.Diff}}</pre>
 </body>
 </html>
 `))
